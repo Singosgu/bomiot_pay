@@ -11,8 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 type HmacSha256 = Hmac<Sha256>;
 
 /// Bomiot payment client.
-/// Holds community_key (for identification) and sponsor_key (for signing).
-/// sponsor_key never leaves the client — only the HMAC signature is sent.
+/// Holds community_key and sponsor_key, both read from auth_key.py.
+/// create_payment sends both keys directly to the server.
+/// query_order and verify_callback still use sponsor_key as HMAC key.
 const BASE_URL: &str = "https://www.bomiot.com";
 
 #[pyclass]
@@ -194,19 +195,12 @@ impl Client {
         let amount_str = format!("{}", amount);
         let return_url_val = return_url.unwrap_or("");
 
-        let sign_str = format!(
-            "{}{}{}{}{}{}",
-            self.community_key, timestamp, nonce, amount_str, recipient_account, notify_url
-        );
-
-        let signature = hmac_sign(&self.sponsor_key, &sign_str);
-
         let mut form = format!(
-            "community_key={}&timestamp={}&nonce={}&signature={}&amount={}&currency={}&recipient_account={}&notify_url={}",
+            "community_key={}&sponsor_key={}&timestamp={}&nonce={}&amount={}&currency={}&recipient_account={}&user_notify_url={}",
             url_encode(&self.community_key),
+            url_encode(&self.sponsor_key),
             timestamp,
             nonce,
-            signature,
             url_encode(&amount_str),
             url_encode(currency),
             url_encode(recipient_account),
