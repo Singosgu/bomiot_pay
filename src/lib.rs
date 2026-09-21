@@ -6,6 +6,7 @@ use rand::Rng;
 use serde_json::Value;
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -50,15 +51,91 @@ fn reqwest_err(e: reqwest::Error) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
 }
 
+/// Read COMMUNITY_KEY and SPONSOR_KEY from auth_key.py in WORKING_SPACE.
+fn load_keys_from_auth_file(py: Python) -> PyResult<(String, String)> {
+    // Try to get WORKING_SPACE from Django settings
+    let working_space = py
+        .import_bound("django.conf")?
+        .getattr("settings")?
+        .getattr("WORKING_SPACE")
+        .and_then(|v| v.extract::<String>())
+        .or_else(|_| {
+            // Fallback: replicate Django's WORKING_SPACE logic
+            // if IS_LAN == 'true': os.path.dirname(sys.executable)
+            // else: os.getcwd()
+            let is_lan = py
+                .import_bound("os")?
+                .getattr("environ")
+                .and_then(|env| env.get_item("IS_LAN"))
+                .and_then(|v| v.extract::<String>())
+                .unwrap_or_else(|_| "false".to_string());
+            if is_lan == "true" {
+                let exe = py.import_bound("sys")?.getattr("executable")?;
+                let exe_str = exe.extract::<String>()?;
+                py.import_bound("os")?
+                    .getattr("path")?
+                    .getattr("dirname")?
+                    .call1((exe_str,))?
+                    .extract::<String>()
+            } else {
+                let os_mod = py.import_bound("os")?;
+                let cwd = os_mod.getattr("getcwd")?.call0()?;
+                cwd.extract::<String>()
+            }
+        })?;
+
+    let auth_key_path = format!("{}/auth_key.py", working_space);
+    let content = fs::read_to_string(&auth_key_path).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Cannot read auth_key.py at {}: {}. Please pass community_key and sponsor_key manually.",
+            auth_key_path, e
+        ))
+    })?;
+
+    let community_key = extract_assignment(&content, "COMMUNITY_KEY").ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("COMMUNITY_KEY not found in auth_key.py")
+    })?;
+    let sponsor_key = extract_assignment(&content, "SPONSOR_KEY").ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("SPONSOR_KEY not found in auth_key.py")
+    })?;
+
+    Ok((community_key, sponsor_key))
+}
+
+/// Extract a string value from a Python assignment like: NAME = "value"
+fn extract_assignment(content: &str, name: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(name) {
+            // Find the '=' sign
+            if let Some(eq_pos) = trimmed.find('=') {
+                let val_part = trimmed[eq_pos + 1..].trim();
+                // Strip surrounding quotes
+                let unquoted = val_part
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .or_else(|| val_part.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                    .unwrap_or(val_part);
+                return Some(unquoted.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[pymethods]
 impl Client {
     #[new]
-    #[pyo3(signature = (community_key, sponsor_key))]
-    fn new(community_key: String, sponsor_key: String) -> Self {
-        Client {
-            community_key,
-            sponsor_key,
-        }
+    #[pyo3(signature = (community_key=None, sponsor_key=None))]
+    fn new(community_key: Option<String>, sponsor_key: Option<String>, py: Python) -> PyResult<Self> {
+        let (ck, sk) = match (community_key, sponsor_key) {
+            (Some(c), Some(s)) => (c, s),
+            _ => load_keys_from_auth_file(py)?,
+        };
+        Ok(Client {
+            community_key: ck,
+            sponsor_key: sk,
+        })
     }
 
     /// Create a payment order with royalty split.
