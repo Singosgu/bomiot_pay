@@ -1,0 +1,16 @@
+[package]
+name = "bomiot_pay"
+version = "0.1.1"
+edition = "2021"
+
+[lib]
+name = "bomiot_pay"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+hmac = "0.12"
+sha2 = "0.10"
+serde_json = "1.0"
+rand = "0.8"
