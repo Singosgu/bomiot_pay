@@ -1,11 +1,10 @@
 use hmac::{Hmac, Mac};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict};
 use pyo3::Bound;
 use rand::Rng;
 use serde_json::Value;
 use sha2::Sha256;
-use std::collections::HashMap;
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -47,22 +46,61 @@ struct OrderStatus {
     fail_reason: String,
 }
 
-fn reqwest_err(e: reqwest::Error) -> PyErr {
-    pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+/// HTTP request via Python urllib (avoids native TLS deps like ring/openssl).
+fn http_request(
+    py: Python,
+    url: &str,
+    method: &str,
+    body: Option<&str>,
+) -> PyResult<(u16, String)> {
+    let urllib = py.import_bound("urllib.request")?;
+
+    let request = match body {
+        Some(data) => {
+            let req = urllib.getattr("Request")?;
+            let bytes = PyBytes::new_bound(py, data.as_bytes());
+            req.call1((url, bytes))?
+        }
+        None => {
+            let req = urllib.getattr("Request")?;
+            req.call1((url,))?
+        }
+    };
+    request.setattr("method", method)?;
+
+    // urlopen raises HTTPError for non-200
+    match urllib.getattr("urlopen")?.call1((request,)) {
+        Ok(resp) => {
+            let status_code = resp.getattr("getcode")?.call0()?.extract::<i32>()? as u16;
+            let body = resp.call_method0("read")?.extract::<Vec<u8>>()?;
+            let body_str = String::from_utf8_lossy(&body).to_string();
+            Ok((status_code, body_str))
+        }
+        Err(err) => {
+            let urllib_err = py.import_bound("urllib.error")?;
+            let http_err_type = urllib_err.getattr("HTTPError")?;
+            if err.matches(py, &http_err_type) {
+                let value = err.into_value(py);
+                let vb = value.bind(py);
+                let code = vb.getattr("code")?.extract::<i32>()? as u16;
+                let body = vb.call_method0("read")?.extract::<Vec<u8>>()?;
+                let body_str = String::from_utf8_lossy(&body).to_string();
+                Ok((code, body_str))
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 /// Read COMMUNITY_KEY and SPONSOR_KEY from auth_key.py in WORKING_SPACE.
 fn load_keys_from_auth_file(py: Python) -> PyResult<(String, String)> {
-    // Try to get WORKING_SPACE from Django settings
     let working_space = py
         .import_bound("django.conf")?
         .getattr("settings")?
         .getattr("WORKING_SPACE")
         .and_then(|v| v.extract::<String>())
         .or_else(|_| {
-            // Fallback: replicate Django's WORKING_SPACE logic
-            // if IS_LAN == 'true': os.path.dirname(sys.executable)
-            // else: os.getcwd()
             let is_lan = py
                 .import_bound("os")?
                 .getattr("environ")
@@ -107,10 +145,8 @@ fn extract_assignment(content: &str, name: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with(name) {
-            // Find the '=' sign
             if let Some(eq_pos) = trimmed.find('=') {
                 let val_part = trimmed[eq_pos + 1..].trim();
-                // Strip surrounding quotes
                 let unquoted = val_part
                     .strip_prefix('"')
                     .and_then(|s| s.strip_suffix('"'))
@@ -165,31 +201,24 @@ impl Client {
 
         let signature = hmac_sign(&self.sponsor_key, &sign_str);
 
-        let mut form = HashMap::new();
-        form.insert("community_key".to_string(), self.community_key.clone());
-        form.insert("timestamp".to_string(), timestamp.to_string());
-        form.insert("nonce".to_string(), nonce.clone());
-        form.insert("signature".to_string(), signature);
-        form.insert("amount".to_string(), amount_str);
-        form.insert("currency".to_string(), currency.to_string());
-        form.insert("recipient_account".to_string(), recipient_account.to_string());
-        form.insert("notify_url".to_string(), notify_url.to_string());
+        let mut form = format!(
+            "community_key={}&timestamp={}&nonce={}&signature={}&amount={}&currency={}&recipient_account={}&notify_url={}",
+            url_encode(&self.community_key),
+            timestamp,
+            nonce,
+            signature,
+            url_encode(&amount_str),
+            url_encode(currency),
+            url_encode(recipient_account),
+            url_encode(notify_url)
+        );
         if !return_url_val.is_empty() {
-            form.insert("return_url".to_string(), return_url_val.to_string());
+            form.push_str(&format!("&return_url={}", url_encode(return_url_val)));
         }
 
         let url = format!("{}/alipayment/sponsor/pay/", BASE_URL);
 
-        let response = py.allow_threads(|| {
-            reqwest::blocking::Client::new()
-                .post(&url)
-                .form(&form)
-                .send()
-                .map_err(reqwest_err)
-        })?;
-
-        let status_code = response.status().as_u16();
-        let body = response.text().map_err(reqwest_err)?;
+        let (status_code, body) = http_request(py, &url, "POST", Some(&form))?;
 
         if status_code != 200 {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -238,12 +267,7 @@ impl Client {
             url_encode(order_id)
         );
 
-        let response = py.allow_threads(|| {
-            reqwest::blocking::Client::new().get(&url).send().map_err(reqwest_err)
-        })?;
-
-        let status_code = response.status().as_u16();
-        let body = response.text().map_err(reqwest_err)?;
+        let (status_code, body) = http_request(py, &url, "GET", None)?;
 
         if status_code != 200 {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
