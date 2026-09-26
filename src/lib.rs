@@ -14,7 +14,13 @@ type HmacSha256 = Hmac<Sha256>;
 /// Holds community_key and sponsor_key, both read from auth_key.py.
 /// create_payment sends both keys directly to the server.
 /// query_order and verify_callback still use sponsor_key as HMAC key.
-const BASE_URL: &str = "https://www.bomiot.com";
+///
+/// Base URL can be overridden via the BOMIOT_PAY_BASE_URL env var
+/// (e.g. http://127.0.0.1:8000 for local testing). Defaults to bomiot.com.
+fn base_url() -> String {
+    std::env::var("BOMIOT_PAY_BASE_URL")
+        .unwrap_or_else(|_| "https://www.bomiot.com".to_string())
+}
 
 #[pyclass]
 struct Client {
@@ -175,8 +181,14 @@ impl Client {
         })
     }
 
-    /// Create a payment order with royalty split.
-    #[pyo3(signature = (amount, currency, recipient_account, notify_url, return_url=None))]
+    /// Create a payment order.
+    ///
+    /// pay_mode:
+    ///   - "split"  (default): royalty split, requires recipient_account and
+    ///     the merchant's Alipay app must have the royalty-split API enabled.
+    ///   - "direct": direct payment, funds go straight to the merchant account.
+    ///     recipient_account is ignored, no royalty-split permission needed.
+    #[pyo3(signature = (amount, currency, recipient_account, notify_url, pay_mode="split", return_url=None))]
     fn create_payment(
         &self,
         py: Python,
@@ -184,6 +196,7 @@ impl Client {
         currency: &str,
         recipient_account: &str,
         notify_url: &str,
+        pay_mode: &str,
         return_url: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
         let timestamp = SystemTime::now()
@@ -196,7 +209,7 @@ impl Client {
         let return_url_val = return_url.unwrap_or("");
 
         let mut form = format!(
-            "community_key={}&sponsor_key={}&timestamp={}&nonce={}&amount={}&currency={}&recipient_account={}&user_notify_url={}",
+            "community_key={}&sponsor_key={}&timestamp={}&nonce={}&amount={}&currency={}&recipient_account={}&user_notify_url={}&pay_mode={}",
             url_encode(&self.community_key),
             url_encode(&self.sponsor_key),
             timestamp,
@@ -204,13 +217,14 @@ impl Client {
             url_encode(&amount_str),
             url_encode(currency),
             url_encode(recipient_account),
-            url_encode(notify_url)
+            url_encode(notify_url),
+            url_encode(pay_mode)
         );
         if !return_url_val.is_empty() {
             form.push_str(&format!("&return_url={}", url_encode(return_url_val)));
         }
 
-        let url = format!("{}/alipayment/sponsor/pay/", BASE_URL);
+        let url = format!("{}/alipayment/sponsor/pay/", base_url());
 
         let (status_code, body) = http_request(py, &url, "POST", Some(&form))?;
 
@@ -253,7 +267,7 @@ impl Client {
 
         let url = format!(
             "{}/alipayment/sponsor/order-status/?community_key={}&timestamp={}&nonce={}&signature={}&order_id={}",
-            BASE_URL,
+            base_url(),
             url_encode(&self.community_key),
             timestamp,
             nonce,
